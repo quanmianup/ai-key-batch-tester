@@ -374,7 +374,7 @@ async function run(){
   const model=document.getElementById('model').value.trim();
   const keys=parseKeys(document.getElementById('keys').value);
   if(!keys.length){alert('请至少输入一个 key');return;}
-  if(!model){alert('请填写模型');return;}
+  if(!model){document.getElementById('hint').textContent='模型留空将自动探测可用模型';}
   const btn=document.getElementById('btnRun'),spin=document.getElementById('spin');
   btn.disabled=true;spin.style.display='inline';
   try{
@@ -456,7 +456,8 @@ function renderDetect(){
       :(x.winner_chat?'<span class="mono muted">'+x.winner_chat+'</span>':'<span class="mono faint">—</span>');
     const probes=(x.checks||[]).map(c=>{
       const cls=c.state==='通过'?'ok':(c.state==='有效'?'warn':'bad');
-      return '<span class="probe '+cls+'">'+esc(c.label.split(' ')[0])+'·'+esc(c.state)+'</span>';
+      const mdl=(c.model&&c.state!=='失效')?'·'+esc(c.model):'';
+      return '<span class="probe '+cls+'">'+esc(c.label.split(' ')[0])+'·'+esc(c.state)+mdl+'</span>';
     }).join(' ');
     const det=x.detail?'<div class="reply dim">'+esc(trunc(x.detail,130))+'</div>':'';
     tb.insertAdjacentHTML('beforeend','<tr><td class="mono faint">'+String(i+1).padStart(2,'0')+'</td><td><span class="key">'+esc(x.masked)+'</span></td><td>'+win+'</td><td>'+url+'</td><td>'+chat+'</td><td>'+probes+det+'</td></tr>');
@@ -674,6 +675,32 @@ def pick_working_model(vendor, base, key, model_ids, limit=6):
     return None, None, "", ""
 
 
+def _model_or_path_fail(code, errmsg):
+    """判断失败原因是否可能靠『换模型 / 换路径』解决（而不是 key 或余额问题）。"""
+    if code == 404:
+        return True
+    m = (errmsg or "").lower()
+    return bool(re.search(r"model .* not|not found|does not exist|unknown model|invalid model|no such model|not_found|no route", m))
+
+
+def chat_with_fallback(vendor, base, key, model):
+    """先按指定模型测；若失败且疑似『模型不存在/路径不对』（非鉴权、非限额），
+    自动拉真实模型列表（带 /v1 兼容）挑一个能对话的模型重试。
+
+    返回 (code, reply, errmsg, used_base, used_model)。
+    """
+    code, reply, errmsg = do_chat(vendor, base, key, model)
+    used_base, used_model = base, model
+    if code == 200 or is_invalid_key(code, errmsg) or not _model_or_path_fail(code, errmsg):
+        return code, reply, errmsg, used_base, used_model
+    mc, mids, _, auto_base = list_models_auto(vendor, base, key)
+    if mc == 200 and mids and auto_base:
+        picked, c2, r2, e2 = pick_working_model(vendor, auto_base, key, mids)
+        if picked:
+            return c2, r2, e2, auto_base, picked
+    return code, reply, errmsg, used_base, used_model
+
+
 def list_models(vendor, base, key):
     base = base.rstrip("/")
     code, data = http_request("GET", base + "/models", auth_headers(vendor, key), timeout=40)
@@ -771,7 +798,8 @@ def conclude(usable, state, chat_code, errmsg):
 
 
 def test_key(vendor, base, key, model):
-    chat_code, reply, errmsg = do_chat(vendor, base, key, model)
+    # 模型不存在 / 路径缺 /v1 时自动换用真实可用模型，避免误判为不可用
+    chat_code, reply, errmsg, used_base, used_model = chat_with_fallback(vendor, base, key, model)
     if chat_code == 200:
         state, usable, auth_ok = "通过", True, True
     elif is_invalid_key(chat_code, errmsg):
@@ -783,6 +811,8 @@ def test_key(vendor, base, key, model):
         "state": state, "auth_ok": auth_ok,
         "chat_code": chat_code, "usable": usable,
         "reply": reply, "errmsg": errmsg,
+        "model": used_model, "base": used_base,
+        "model_switched": bool(used_model and model and used_model != model),
     }
     r["concl"] = conclude(r["usable"], r["state"], r["chat_code"], r["errmsg"])
     return r
@@ -866,23 +896,12 @@ class Handler(BaseHTTPRequestHandler):
 
             def probe(t):
                 kid, v, key = t
-                if kid == "custom":
-                    # 中转站模型名常非标准，且 /models 会列出实际不支持的模型，
-                    # 先拉列表（自动兼容带不带 /v1），再按顺序找出真能对话的那个
-                    in_url = v.get("input_url") or v["base_url"]
-                    mc, mids, _, used_base = list_models_auto(v, in_url, key)
-                    if mc == 200 and mids:
-                        picked, code, reply, errmsg = pick_working_model(v, used_base, key, mids)
-                        if picked is None:
-                            code, reply, errmsg = do_chat(v, used_base, key, mids[0])
-                    else:
-                        used_base = (normalize_base(v, in_url) or [in_url])[0]
-                        code, reply, errmsg = do_chat(v, used_base, key, v["default_model"])
-                    if not used_base:
-                        used_base = in_url
-                else:
-                    used_base = v["base_url"]
-                    code, reply, errmsg = do_chat(v, used_base, key, v["default_model"])
+                # 全协议统一：带不带 /v1 自动归一化；默认模型不适用时自动挑真实可用模型
+                in_url = v.get("input_url") or v["base_url"]
+                base0 = (normalize_base(v, in_url) or [in_url])[0]
+                code, reply, errmsg, used_base, used_model = chat_with_fallback(
+                    v, base0, key, v["default_model"])
+                used_base = used_base or base0
                 if code == 200:
                     state = "通过"
                 elif is_invalid_key(code, errmsg):
@@ -891,6 +910,7 @@ class Handler(BaseHTTPRequestHandler):
                     state = "有效"
                 return key, {"vendor": kid, "label": v["label"],
                              "url": used_base or v.get("input_url") or v["base_url"],
+                             "model": used_model,
                              "state": state, "chat_code": code,
                              "reply": reply, "errmsg": errmsg}
 
@@ -910,10 +930,11 @@ class Handler(BaseHTTPRequestHandler):
                         "key": key, "masked": mask_key(key),
                         "winner": winner["vendor"], "winner_label": winner["label"],
                         "winner_url": winner["url"], "winner_state": winner["state"],
-                        "winner_chat": winner["chat_code"],
+                        "winner_chat": winner["chat_code"], "winner_model": winner.get("model") or "",
                         "detail": (winner["reply"][:400] if winner["state"] == "通过" else winner["errmsg"][:400]),
                         "checks": [{"vendor": c["vendor"], "label": c["label"],
-                                    "state": c["state"], "chat_code": c["chat_code"]} for c in checks],
+                                    "state": c["state"], "chat_code": c["chat_code"],
+                                    "model": c.get("model") or ""} for c in checks],
                     })
                 else:
                     results.append({
@@ -922,7 +943,8 @@ class Handler(BaseHTTPRequestHandler):
                         "winner_state": "", "winner_chat": "",
                         "detail": "所有常见厂商均拒绝该 key，无法匹配官方接口",
                         "checks": [{"vendor": c["vendor"], "label": c["label"],
-                                    "state": c["state"], "chat_code": c["chat_code"]} for c in checks],
+                                    "state": c["state"], "chat_code": c["chat_code"],
+                                    "model": c.get("model") or ""} for c in checks],
                     })
             self._send(200, {"results": results, "tested": len(results)})
             return
@@ -952,7 +974,8 @@ class Handler(BaseHTTPRequestHandler):
             "results": results,
             "summary": {"total": len(results), "usable": sum(1 for r in results if r["usable"]),
                         "auth_ok": sum(1 for r in results if r["auth_ok"])},
-            "vendor": vendor["label"], "url": eff_base, "model": model,
+            "vendor": vendor["label"], "url": eff_base,
+            "model": (results[0].get("model") or model) if results else model,
         })
 
     def log_message(self, fmt, *args):
