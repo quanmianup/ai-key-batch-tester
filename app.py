@@ -7,6 +7,7 @@ AI Key 批量测试 · 多厂商分 Tab（终端感控制台）
 """
 import json
 import re
+import urllib.parse
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -618,6 +619,61 @@ def auth_headers(vendor, key):
     return {"Authorization": "Bearer " + key}
 
 
+def normalize_base(vendor, url):
+    """归一化 API 基地址，使带不带 /v1 后缀都能用。
+
+    返回候选基址列表（按可能性排序），调用方依次尝试，第一个返回可用结果的胜出。
+    - 用户填 https://xxx / https://xxx/ / https://xxx/v1 / https://xxx/v1/ 均可
+    - 已带 /v1（或厂商专属后缀）时不重复追加，避免 /v1/v1 -> 404
+    - 官方主机（api.openai.com 等）缺后缀时优先补 /v1，中转站则原样优先
+    """
+    u = (url or "").strip()
+    if not u:
+        return []
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    u = u.rstrip("/")
+
+    suffix = "/v1" if vendor.get("kind") != "gemini" else "/v1beta"
+    path = urllib.parse.urlparse(u).path.rstrip("/")
+    segs = [s for s in path.split("/") if s]
+
+    if segs and re.fullmatch(r"v\d+[a-z0-9]*", segs[-1]):
+        return [u]                       # 已带版本后缀，原样用
+
+    with_suffix, bare = u + suffix, u
+    host = (urllib.parse.urlparse(u).hostname or "").lower()
+    # 官方 API 主机通常必须带 /v1；中转站两种都试，原样优先
+    official = host in ("api.openai.com", "api.anthropic.com", "api.deepseek.com",
+                        "api.x.ai", "generativelanguage.googleapis.com")
+    order = [with_suffix, bare] if official else [bare, with_suffix]
+    return list(dict.fromkeys(order))
+
+
+def is_missing_version_path(code, msg):
+    """判断失败是否因为缺版本前缀（试另一个候选有用）。"""
+    if code == 404:
+        return True
+    m = (msg or "").lower()
+    return bool(re.search(r"not found|no route|invalid url|unknown url|不可用|not_found", m))
+
+
+def pick_working_model(vendor, base, key, model_ids, limit=6):
+    """在模型列表中按顺序找出真正能对话的模型。
+
+    中转站的 /models 常列出该站并不真正支持的模型（如 pojia 列出全部 gpt-* 但实际 404），
+    只取第一项会误判为不可用。这里依次试，第一个 200 的胜出。
+    """
+    # 优先试类似 chat/completion 的模型，跳过明显是图像/向量/语音的
+    skip = re.compile(r"(image|embed|tts|whisper|audio|rerank|moderation|dall)", re.I)
+    lead = [m for m in model_ids if not skip.search(m)]
+    for m in (lead or model_ids)[:limit]:
+        code, reply, errmsg = do_chat(vendor, base, key, m)
+        if code == 200:
+            return m, code, reply, errmsg
+    return None, None, "", ""
+
+
 def list_models(vendor, base, key):
     base = base.rstrip("/")
     code, data = http_request("GET", base + "/models", auth_headers(vendor, key), timeout=40)
@@ -633,6 +689,20 @@ def list_models(vendor, base, key):
                 ids = [str(m.get("id", "")) for m in dl if m.get("id")]
         return code, ids, ""
     return code, ids, err_text(data)
+
+
+def list_models_auto(vendor, url, key):
+    """带 /v1 兼容的模型列表：依次尝试归一化候选地址。"""
+    last = (404, [], "no candidate")
+    for base in normalize_base(vendor, url):
+        code, ids, err = list_models(vendor, base, key)
+        if code == 200 and ids:
+            return code, ids, err, base
+        last = (code, ids, err)
+        # 鉴权/额度类错误换个路径也一样，提前停
+        if not is_missing_version_path(code, err):
+            return code, ids, err, base
+    return last[0], last[1], last[2], ""
 
 
 def do_chat(vendor, base, key, model):
@@ -769,12 +839,13 @@ class Handler(BaseHTTPRequestHandler):
             if not ks:
                 self._send(400, {"error": "no key"})
                 return
-            code, models, err = 400, [], "no valid key"
+            code, models, err, used_base = 400, [], "no valid key", ""
             for key in ks:
-                code, models, err = list_models(vendor, base, key)
+                code, models, err, used_base = list_models_auto(vendor, url, key)
                 if code == 200:
                     break
-            self._send(200, {"code": code, "models": models, "err": err, "tested": len(ks)})
+            self._send(200, {"code": code, "models": models, "err": err,
+                             "tested": len(ks), "base": used_base or base})
             return
 
         if self.path == "/api/detect":
@@ -789,28 +860,37 @@ class Handler(BaseHTTPRequestHandler):
             custom_url = (payload.get("url") or "").strip().rstrip("/")
             if custom_url:
                 # 支持自定义中转站地址：额外加一个 OpenAI 兼容探针
-                probes.append(("custom", {**VENDORS["openai"], "base_url": custom_url,
+                # input_url 保留用户原始输入，探测时由 normalize_base 兼容 /v1 有无
+                probes.append(("custom", {**VENDORS["openai"], "input_url": custom_url,
                                           "label": "自定义 (OpenAI兼容)", "kind": "openai"}))
 
             def probe(t):
                 kid, v, key = t
                 if kid == "custom":
-                    # 中转站模型名常非标准（如 pojia 的 deepseek-v4-flash），
-                    # 先拉真实模型列表，取第一个做对话，避免 default_model 404 误判
-                    mc, mids, _ = list_models(v, v["base_url"], key)
+                    # 中转站模型名常非标准，且 /models 会列出实际不支持的模型，
+                    # 先拉列表（自动兼容带不带 /v1），再按顺序找出真能对话的那个
+                    in_url = v.get("input_url") or v["base_url"]
+                    mc, mids, _, used_base = list_models_auto(v, in_url, key)
                     if mc == 200 and mids:
-                        code, reply, errmsg = do_chat(v, v["base_url"], key, mids[0])
+                        picked, code, reply, errmsg = pick_working_model(v, used_base, key, mids)
+                        if picked is None:
+                            code, reply, errmsg = do_chat(v, used_base, key, mids[0])
                     else:
-                        code, reply, errmsg = do_chat(v, v["base_url"], key, v["default_model"])
+                        used_base = (normalize_base(v, in_url) or [in_url])[0]
+                        code, reply, errmsg = do_chat(v, used_base, key, v["default_model"])
+                    if not used_base:
+                        used_base = in_url
                 else:
-                    code, reply, errmsg = do_chat(v, v["base_url"], key, v["default_model"])
+                    used_base = v["base_url"]
+                    code, reply, errmsg = do_chat(v, used_base, key, v["default_model"])
                 if code == 200:
                     state = "通过"
                 elif is_invalid_key(code, errmsg):
                     state = "失效"
                 else:
                     state = "有效"
-                return key, {"vendor": kid, "label": v["label"], "url": v["base_url"],
+                return key, {"vendor": kid, "label": v["label"],
+                             "url": used_base or v.get("input_url") or v["base_url"],
                              "state": state, "chat_code": code,
                              "reply": reply, "errmsg": errmsg}
 
@@ -857,15 +937,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "no keys"})
             return
         results = [None] * len(keys)
+        # 归一化：带不带 /v1 都能用；先用首个 key 探出真正生效的基址
+        cands = normalize_base(vendor, url)
+        eff_base = cands[0] if cands else base
+        if len(cands) > 1:
+            code0, ids0, _, used0 = list_models_auto(vendor, url, keys[0])
+            if code0 == 200 and used0:
+                eff_base = used0
         with ThreadPoolExecutor(max_workers=6) as ex:
-            futs = {ex.submit(test_key, vendor, base, k, model): i for i, k in enumerate(keys)}
+            futs = {ex.submit(test_key, vendor, eff_base, k, model): i for i, k in enumerate(keys)}
             for fut in futs:
                 results[futs[fut]] = fut.result()
         self._send(200, {
             "results": results,
             "summary": {"total": len(results), "usable": sum(1 for r in results if r["usable"]),
                         "auth_ok": sum(1 for r in results if r["auth_ok"])},
-            "vendor": vendor["label"], "url": base, "model": model,
+            "vendor": vendor["label"], "url": eff_base, "model": model,
         })
 
     def log_message(self, fmt, *args):
