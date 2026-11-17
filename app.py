@@ -331,13 +331,14 @@ function switchTab(id){
   if(isDetect){
     if(!state[id])state[id]={url:'',model:'',keys:''};
     document.getElementById('keys').value=state[id].keys;
-    document.getElementById('urlField').style.display='none';
+    document.getElementById('url').value=state[id].url;
+    document.getElementById('urlField').style.display='';
     document.getElementById('modelField').style.display='none';
     document.getElementById('btnRun').textContent='⚡ 一键检测';
     document.getElementById('btnFetchModels').style.display='none';
     document.getElementById('btnExportCsv').disabled=true;
     document.getElementById('btnExportGood').disabled=true;
-    document.getElementById('hint').textContent='粘贴 key（可多行），自动探测 OpenAI / Claude / DeepSeek / Gemini / xAI，标出归属厂商与官方 URL';
+    document.getElementById('hint').textContent='粘贴 key（可多行），自动探测 OpenAI / Claude / DeepSeek / Gemini / xAI；识别第三方中转站 key 时，在上方填它的 API 基地址（如 https://xxx/v1）';
     document.getElementById('resultCard').style.display='none';
     document.getElementById('emptyCard').style.display='none';
     if(detectResults)renderDetect();else document.getElementById('detectCard').style.display='none';
@@ -423,11 +424,12 @@ let detectResults=null;
 async function runDetect(){
   const keys=parseKeys(document.getElementById('keys').value);
   if(!keys.length){alert('请先粘贴至少一个 key');return;}
+  const url=document.getElementById('url').value.trim();
   const btn=document.getElementById('btnRun'),spin=document.getElementById('spin');
   btn.disabled=true;spin.style.display='inline';
-  document.getElementById('hint').textContent='检测中…（并行探测 5 家官方接口）';
+  document.getElementById('hint').textContent=url?('检测中…（并行探测 5 家官方 + 自定义地址 '+url+'）'):'检测中…（并行探测 5 家官方接口）';
   try{
-    const r=await fetch('/api/detect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys})});
+    const r=await fetch('/api/detect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys,url})});
     const d=await r.json();
     detectResults=d.results||[];
     renderDetect();
@@ -535,7 +537,7 @@ async function init(){
   const tabs=document.getElementById('tabs');
   VENDORS.forEach(v=>{const b=document.createElement('button');b.className='tab';b.id='tab-'+v.id;b.textContent=v.label;b.onclick=()=>switchTab(v.id);tabs.appendChild(b);});
   const db=document.createElement('button');db.className='tab';db.id='tab-detect';db.textContent='⚡ 未知 Key 检测';db.onclick=()=>switchTab('detect');tabs.appendChild(db);
-  ['url','model','keys'].forEach(id=>document.getElementById(id).addEventListener('input',()=>{if(activeV==='detect'){state['detect'].keys=document.getElementById('keys').value;return;}state[activeV][id]=document.getElementById(id).value;}));
+  ['url','model','keys'].forEach(id=>document.getElementById(id).addEventListener('input',()=>{if(activeV==='detect'){state['detect'].keys=document.getElementById('keys').value;state['detect'].url=document.getElementById('url').value;return;}state[activeV][id]=document.getElementById(id).value;}));
   document.getElementById('btnRun').addEventListener('click',()=>{if(activeV==='detect')runDetect();else run();});
   document.getElementById('btnFetchModels').addEventListener('click',fetchModels);
   document.getElementById('modelBtn').addEventListener('click',e=>{e.stopPropagation();refreshMenu('');openMenu();});
@@ -568,6 +570,11 @@ def http_request(method, url, headers, body=None, timeout=60):
     if body is not None:
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
+    # Cloudflare 防护站（如 pojia.org）会拦 Python 默认 UA（403 code 1010），
+    # 统一带浏览器 UA，否则后端代发探测对这些站点必失败。
+    headers.setdefault("User-Agent",
+                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/125.0 Safari/537.36")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -779,10 +786,24 @@ class Handler(BaseHTTPRequestHandler):
             probes = [("openai", VENDORS["openai"]), ("claude", VENDORS["claude"]),
                       ("deepseek", VENDORS["deepseek"]), ("gemini", VENDORS["gemini"]),
                       ("xai", VENDORS["xai"])]
+            custom_url = (payload.get("url") or "").strip().rstrip("/")
+            if custom_url:
+                # 支持自定义中转站地址：额外加一个 OpenAI 兼容探针
+                probes.append(("custom", {**VENDORS["openai"], "base_url": custom_url,
+                                          "label": "自定义 (OpenAI兼容)", "kind": "openai"}))
 
             def probe(t):
                 kid, v, key = t
-                code, reply, errmsg = do_chat(v, v["base_url"], key, v["default_model"])
+                if kid == "custom":
+                    # 中转站模型名常非标准（如 pojia 的 deepseek-v4-flash），
+                    # 先拉真实模型列表，取第一个做对话，避免 default_model 404 误判
+                    mc, mids, _ = list_models(v, v["base_url"], key)
+                    if mc == 200 and mids:
+                        code, reply, errmsg = do_chat(v, v["base_url"], key, mids[0])
+                    else:
+                        code, reply, errmsg = do_chat(v, v["base_url"], key, v["default_model"])
+                else:
+                    code, reply, errmsg = do_chat(v, v["base_url"], key, v["default_model"])
                 if code == 200:
                     state = "通过"
                 elif is_invalid_key(code, errmsg):
